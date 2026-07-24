@@ -17,8 +17,8 @@ process.stdin.on('end', async () => {
     if (text) {
       await fetch(`http://127.0.0.1:${PORT}/speak`, {
         method: 'POST',
-        headers: { 'content-type': 'text/plain; charset=utf-8' },
-        body: text,
+        headers: { 'content-type': 'application/json; charset=utf-8' },
+        body: JSON.stringify({ text, session: input?.session_id ?? '' }),
         signal: AbortSignal.timeout(1000),
       });
     }
