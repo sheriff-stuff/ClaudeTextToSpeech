@@ -7,6 +7,7 @@
 
 import http from 'node:http';
 
+const VERSION = '0.5';
 const PORT = Number(process.env.CLAUDE_TTS_PORT) || 8765;
 const HEARTBEAT_MS = 30_000;
 
@@ -28,10 +29,11 @@ const PAGE = /* html */ `<!doctype html>
   #log { list-style: none; padding: 0; }
   #log li { padding: .4rem 0; border-bottom: 1px solid #ddd; }
   #log time { color: #666; font-size: .85em; margin-right: .6rem; }
+  h1 .version { font-size: .5em; font-weight: normal; color: #666; margin-left: .5rem; vertical-align: middle; }
 </style>
 </head>
 <body>
-<h1>Claude question speaker</h1>
+<h1>Claude question speaker<span class="version">v${VERSION}</span></h1>
 <button id="enable">Enable sound</button>
 <p id="status" class="disconnected"><span class="dot"></span><span id="status-text">not connected</span></p>
 <ul id="log"></ul>
