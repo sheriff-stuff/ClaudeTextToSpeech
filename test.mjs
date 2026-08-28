@@ -1,305 +1,239 @@
-// Self-serve tests — node --test test.mjs. No deps.
+// node --test test.mjs
 //
-// Server and hook are exercised over real HTTP on a scratch port. The Speaker
-// Page script is extracted from the served page and run in node:vm against
-// stubbed browser globals, so speech behavior is testable without a browser.
+// Covers the cleaner, the Stop payload handling, and the real spawned
+// pipeline against stub binaries that record their argv and stdin. Whether it
+// sounds any good is the one thing only ears can judge: see smoke.mjs.
 
-import test from 'node:test';
+import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import http from 'node:http';
-import vm from 'node:vm';
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
 
-const ROOT = dirname(fileURLToPath(import.meta.url));
-const PORT = 8790 + (process.pid % 100);
-const BASE = `http://127.0.0.1:${PORT}`;
+import {
+  buildArgs, cleanForSpeech, findPiper, findVoice, handle, mutePath, pidPath, sampleRateFor,
+} from './.claude/hooks/speak-reply.mjs';
+import { playerArgs } from './.claude/hooks/speak-run.mjs';
 
-// ---------- server helpers ----------
+const HOOK = fileURLToPath(new URL('./.claude/hooks/speak-reply.mjs', import.meta.url));
 
-let serverProc;
+test('cleaner replaces fenced code with a line count', () => {
+  const out = cleanForSpeech('Try this:\n```js\nconst a = 1;\nconst b = 2;\n```\nDone.');
+  assert.match(out, /code block, 2 lines/);
+  assert.doesNotMatch(out, /const/);
+});
 
-function startServer() {
-  return new Promise((resolve, reject) => {
-    serverProc = spawn(process.execPath, [join(ROOT, 'server.mjs')], {
-      env: { ...process.env, CLAUDE_TTS_PORT: String(PORT) },
-    });
-    serverProc.stdout.on('data', (d) => {
-      if (String(d).includes('Question server')) resolve();
-    });
-    serverProc.on('error', reject);
+test('cleaner counts a one-line block in the singular', () => {
+  assert.match(cleanForSpeech('```\nx\n```'), /code block, 1 line\b/);
+});
+
+test('cleaner handles an unterminated fence', () => {
+  const out = cleanForSpeech('Here:\n```js\nconst a = 1;');
+  assert.equal(out, 'Here:\ncode block.');
+});
+
+test('cleaner keeps inline code and paths as words', () => {
+  assert.equal(cleanForSpeech('Edit `server.mjs:42` now'), 'Edit server.mjs:42 now');
+});
+
+test('cleaner strips headings, bullets, quotes and rules', () => {
+  const out = cleanForSpeech('## Plan\n\n- first\n- second\n\n---\n\n> note');
+  assert.equal(out, 'Plan\nfirst\nsecond\nnote');
+});
+
+test('cleaner strips links, images and emphasis', () => {
+  assert.equal(cleanForSpeech('See [the docs](http://x/y) **now** and *soon*'), 'See the docs now and soon');
+  assert.equal(cleanForSpeech('![a diagram](x.png)'), 'a diagram');
+});
+
+test('cleaner keeps an asterisk that is not emphasis', () => {
+  assert.equal(cleanForSpeech('use 2 * 3 here'), 'use 2 * 3 here');
+});
+
+test('cleaner reads a table row as a sentence', () => {
+  const out = cleanForSpeech('| Voice | Size |\n| --- | --- |\n| alba | 60MB |');
+  assert.equal(out, 'Voice, Size\nalba, 60MB');
+});
+
+test('cleaner returns empty for whitespace', () => {
+  assert.equal(cleanForSpeech('   \n\n  '), '');
+  assert.equal(cleanForSpeech(undefined), '');
+});
+
+test('sampleRateFor reads the voice config, else falls back', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tts-voice-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const voice = path.join(dir, 'en_GB-alba-medium.onnx');
+  fs.writeFileSync(voice, '');
+  fs.writeFileSync(`${voice}.json`, JSON.stringify({ audio: { sample_rate: 16000 } }));
+  assert.equal(sampleRateFor(voice), 16000);
+  assert.equal(sampleRateFor(path.join(dir, 'missing.onnx')), 22050);
+});
+
+test('buildArgs points the runner at piper, the voice and the player', () => {
+  const args = buildArgs({
+    piper: 'piper.exe', voice: 'alba.onnx', player: 'ffplay',
+    textFile: 'say.txt', rate: 22050,
   });
-}
+  assert.match(args[0], /speak-run\.mjs$/);
+  assert.deepEqual(args.slice(1), ['piper.exe', 'alba.onnx', 'ffplay', '22050', 'say.txt']);
+});
 
-function listenSse() {
-  // Collects SSE data lines; call .messages() after posting.
-  const lines = [];
-  let namedEvent = false;
-  const req = http.get(`${BASE}/events`, (res) => {
-    res.on('data', (chunk) => {
-      for (const line of String(chunk).split('\n')) {
-        if (line.startsWith('event: ')) namedEvent = true;
-        else if (line.startsWith('data: ')) { if (!namedEvent) lines.push(line.slice(6)); }
-        else if (line === '') namedEvent = false;
-      }
-    });
+test('the environment overrides discovery', () => {
+  assert.equal(findPiper({ CLAUDE_TTS_PIPER: 'X:\\elsewhere\\piper.exe' }), 'X:\\elsewhere\\piper.exe');
+  assert.equal(findVoice({ CLAUDE_TTS_VOICE: 'X:\\elsewhere\\v.onnx' }), 'X:\\elsewhere\\v.onnx');
+});
+
+test('discovery finds a standard install, or nothing', () => {
+  // Whether this box has Piper installed is not the test's business; that the
+  // two answers agree is.
+  const piper = findPiper({});
+  const voice = findVoice({});
+  if (piper) assert.ok(fs.existsSync(piper), `${piper} was reported but is missing`);
+  if (voice) assert.match(voice, /\.onnx$/);
+});
+
+test('handle stays silent with no piper anywhere', (t) => {
+  // Discovery must not find a real install and make this pass by accident.
+  const found = findPiper({});
+  if (found) return t.skip(`Piper is installed at ${found}`);
+  assert.equal(handle({ last_assistant_message: 'hello' }, {}), false);
+});
+
+test('handle stays silent on a hook-driven continuation', () => {
+  assert.equal(handle({ last_assistant_message: 'hello', stop_hook_active: true },
+    { CLAUDE_TTS_PIPER: 'p', CLAUDE_TTS_VOICE: 'v' }), false);
+});
+
+test('handle stays silent while the mute file exists', (t) => {
+  const mute = mutePath();
+  const existed = fs.existsSync(mute);
+  if (!existed) fs.writeFileSync(mute, '');
+  t.after(() => { if (!existed) fs.rmSync(mute, { force: true }); });
+  assert.equal(handle({ last_assistant_message: 'hello' },
+    { CLAUDE_TTS_PIPER: 'p', CLAUDE_TTS_VOICE: 'v' }), false);
+});
+
+// The stub player accepts any argument, so it once let a pipeline ship that
+// ffplay rejected outright. This checks the arguments against the real thing:
+// 50ms of silence, which exits 0 if and only if the flags are accepted.
+test('the real player accepts the arguments we pass it', async (t) => {
+  const player = process.env.CLAUDE_TTS_PLAYER || 'ffplay';
+  const silence = Buffer.alloc(2 * Math.round(22050 * 0.05));
+  const code = await new Promise((resolve) => {
+    const child = spawn(player, playerArgs(22050), { stdio: ['pipe', 'ignore', 'pipe'] });
+    let stderr = '';
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('error', () => resolve('missing'));
+    child.on('exit', (status) => resolve(status === 0 ? 0 : `${status}: ${stderr.trim()}`));
+    child.stdin.on('error', () => {});
+    child.stdin.end(silence);
   });
-  return {
-    messages: () => lines,
-    close: () => req.destroy(),
+  if (code === 'missing') return t.skip(`${player} is not installed`);
+  assert.equal(code, 0);
+});
+
+// --- end to end, through the real spawned runner ---------------------------
+
+// Stubs standing in for piper and the player: each records the argv it was
+// given and the bytes it was fed, so the whole chain is observable. They are
+// .cmd wrappers, which is also the awkward case the runner has to handle:
+// Node refuses to spawn a .cmd without a shell.
+const STUB = `
+import fs from 'node:fs';
+const [target, name, ...argv] = process.argv.slice(2);
+fs.writeFileSync(target + '/' + name + '-argv.txt', argv.join(' '));
+const chunks = [];
+process.stdin.on('data', (c) => chunks.push(c));
+process.stdin.on('end', () => {
+  fs.writeFileSync(target + '/' + name + '-stdin.txt', Buffer.concat(chunks));
+  if (name === 'piper') process.stdout.write('AUDIO');
+});
+`;
+
+function stubs(dir) {
+  const script = path.join(dir, 'stub.mjs');
+  fs.writeFileSync(script, STUB);
+  const cmd = (name) => {
+    const file = path.join(dir, `${name}.cmd`);
+    fs.writeFileSync(file, `@echo off\r\n"${process.execPath}" "${script}" "${dir}" ${name} %*\r\n`);
+    return file;
   };
+  const piper = cmd('piper');
+  const player = cmd('player');
+  const voice = path.join(dir, 'alba.onnx');
+  fs.writeFileSync(voice, '');
+  fs.writeFileSync(`${voice}.json`, JSON.stringify({ audio: { sample_rate: 22050 } }));
+  return { piper, player, voice };
 }
 
-const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function post(body, headers = {}) {
-  await fetch(`${BASE}/speak`, { method: 'POST', headers, body });
-}
-
-// ---------- page harness ----------
-
-class FakeElement {
-  constructor(tag = 'div') {
-    this.tagName = tag;
-    this.children = [];
-    this.listeners = {};
-    this.textContent = '';
-    this.value = '';
-    this.checked = false;
-    this.className = '';
-    this.disabled = false;
-    this.parent = null;
+async function waitForFile(file, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      if (fs.statSync(file).size > 0) return fs.readFileSync(file, 'utf8');
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  addEventListener(type, fn) { (this.listeners[type] ??= []).push(fn); }
-  fire(type) { for (const fn of this.listeners[type] ?? []) fn({ target: this }); }
-  appendChild(child) { child.parent = this; this.children.push(child); return child; }
-  prepend(child) { child.parent = this; this.children.unshift(child); }
-  replaceChildren() { this.children = []; }
-  remove() { const sibs = this.parent.children; sibs.splice(sibs.indexOf(this), 1); }
-  get lastChild() { return this.children[this.children.length - 1]; }
-  // Text nodes are modeled as elements; textContent is enough for asserts.
+  throw new Error(`timed out waiting for ${file}`);
 }
 
-async function fetchPageScript() {
-  const html = await (await fetch(`${BASE}/`)).text();
-  const match = html.match(/<script>([\s\S]*?)<\/script>/);
-  assert.ok(match, 'page script found');
-  return match[1];
-}
-
-function loadPage(script, { store = new Map() } = {}) {
-  const ids = ['enable', 'status', 'status-text', 'log', 'voice', 'rate', 'rate-value', 'mute', 'test'];
-  const byId = Object.fromEntries(ids.map((id) => [id, new FakeElement(id)]));
-  const spoken = [];
-  const voices = [
-    { name: 'Alice', lang: 'en-US' },
-    { name: 'Bob', lang: 'en-GB' },
-  ];
-  let cancelled = false;
-  let reloaded = false;
-
-  class Utterance { constructor(text) { this.text = text; this.rate = 1; this.voice = null; } }
-  class EventSource {
-    constructor() { this.named = {}; context.eventSource = this; }
-    addEventListener(type, fn) { (this.named[type] ??= []).push(fn); }
-    fireEvent(type, data) { for (const fn of this.named[type] ?? []) fn({ data }); }
-  }
-
-  const context = {
-    document: {
-      getElementById: (id) => byId[id],
-      createElement: (tag) => new FakeElement(tag),
-      createTextNode: (text) => { const el = new FakeElement('#text'); el.textContent = text; return el; },
-    },
-    localStorage: {
-      getItem: (k) => (store.has(k) ? store.get(k) : null),
-      setItem: (k, v) => store.set(k, String(v)),
-    },
-    speechSynthesis: {
-      getVoices: () => voices,
-      speak: (u) => spoken.push(u),
-      cancel: () => { cancelled = true; },
-      addEventListener: () => {},
-    },
-    SpeechSynthesisUtterance: Utterance,
-    EventSource,
-    location: { reload: () => { reloaded = true; } },
-    console,
-  };
-  vm.createContext(context);
-  vm.runInContext(script, context);
-
-  return {
-    byId,
-    spoken,
-    store,
-    wasCancelled: () => cancelled,
-    wasReloaded: () => reloaded,
-    fireEvent: (type, data) => context.eventSource.fireEvent(type, data),
-    enable: () => byId.enable.fire('click'),
-    receive: (data) => context.eventSource.onmessage({ data }),
-    receiveJson: (obj) => context.eventSource.onmessage({ data: JSON.stringify(obj) }),
-  };
-}
-
-// ---------- tests ----------
-
-let pageScript;
-
-test.before(async () => {
-  await startServer();
-  pageScript = await fetchPageScript();
-});
-
-test.after(() => serverProc.kill());
-
-test('POST /speak with JSON body broadcasts text and session', async () => {
-  const sse = listenSse();
-  await wait(100);
-  await post(JSON.stringify({ text: 'hello  from\njson', session: 's-1' }),
-    { 'content-type': 'application/json' });
-  await wait(200);
-  sse.close();
-  assert.deepEqual(JSON.parse(sse.messages()[0]), { text: 'hello from json', session: 's-1' });
-});
-
-test('POST /speak with plain text still works', async () => {
-  const sse = listenSse();
-  await wait(100);
-  await post('plain text body');
-  await wait(200);
-  sse.close();
-  assert.deepEqual(JSON.parse(sse.messages()[0]), { text: 'plain text body', session: '' });
-});
-
-test('hook forwards question text and session id', async () => {
-  const sse = listenSse();
-  await wait(100);
-  const hook = spawn(process.execPath, [join(ROOT, '.claude', 'hooks', 'notify-question.mjs')], {
-    env: { ...process.env, CLAUDE_TTS_PORT: String(PORT) },
-  });
-  hook.stdin.end(JSON.stringify({
-    session_id: 'sess-42',
-    tool_input: { questions: [{ question: 'Ship it?' }, { question: 'Which port?' }] },
-  }));
-  await new Promise((r) => hook.on('exit', r));
-  await wait(200);
-  sse.close();
-  assert.deepEqual(JSON.parse(sse.messages()[0]),
-    { text: 'Ship it? … Which port?', session: 'sess-42' });
-});
-
-test('page speaks a received question after enable', () => {
-  const page = loadPage(pageScript);
-  page.enable();
-  page.receiveJson({ text: 'first question', session: 'a' });
-  const texts = page.spoken.map((u) => u.text);
-  assert.ok(texts.includes('first question'), `spoken: ${texts}`);
-});
-
-test('page does not speak before enable, but still logs', () => {
-  const page = loadPage(pageScript);
-  page.receiveJson({ text: 'too early', session: 'a' });
-  assert.equal(page.spoken.length, 0);
-  assert.equal(page.byId.log.children.length, 1);
-});
-
-test('mute blocks speech and cancels in-flight speech', () => {
-  const page = loadPage(pageScript);
-  page.enable();
-  page.byId.mute.checked = true;
-  page.byId.mute.fire('change');
-  assert.ok(page.wasCancelled());
-  const before = page.spoken.length;
-  page.receiveJson({ text: 'silenced', session: 'a' });
-  assert.equal(page.spoken.length, before);
-  assert.equal(page.byId.log.children.length, 1);
-  assert.equal(page.store.get('tts.mute'), 'true');
-});
-
-test('voice and rate apply to utterances and persist', () => {
-  const page = loadPage(pageScript);
-  page.enable();
-  page.byId.voice.value = 'Bob';
-  page.byId.voice.fire('change');
-  page.byId.rate.value = '1.5';
-  page.byId.rate.fire('change');
-  page.receiveJson({ text: 'styled', session: 'a' });
-  const u = page.spoken.at(-1);
-  assert.equal(u.text, 'styled');
-  assert.equal(u.voice?.name, 'Bob');
-  assert.equal(u.rate, 1.5);
-  assert.equal(page.store.get('tts.voice'), 'Bob');
-  assert.equal(page.store.get('tts.rate'), '1.5');
-});
-
-test('settings load from localStorage on startup', () => {
-  const store = new Map([['tts.voice', 'Alice'], ['tts.rate', '0.8'], ['tts.mute', 'false']]);
-  const page = loadPage(pageScript, { store });
-  page.enable();
-  page.receiveJson({ text: 'restored', session: 'a' });
-  const u = page.spoken.at(-1);
-  assert.equal(u.voice?.name, 'Alice');
-  assert.equal(u.rate, 0.8);
-});
-
-test('single session speaks without prefix; second session adds prefixes', () => {
-  const page = loadPage(pageScript);
-  page.enable();
-  page.receiveJson({ text: 'alone', session: 'aaa' });
-  assert.equal(page.spoken.at(-1).text, 'alone');
-  page.receiveJson({ text: 'newcomer', session: 'bbb' });
-  assert.equal(page.spoken.at(-1).text, 'session 2 asks: newcomer');
-  page.receiveJson({ text: 'back again', session: 'aaa' });
-  assert.equal(page.spoken.at(-1).text, 'session 1 asks: back again');
-});
-
-test('plain-text SSE data falls back to speaking the raw text', () => {
-  const page = loadPage(pageScript);
-  page.enable();
-  page.receive('not json at all');
-  assert.equal(page.spoken.at(-1).text, 'not json at all');
-});
-
-test('test button speaks with current settings, even muted and before enable', () => {
-  const store = new Map([['tts.voice', 'Bob'], ['tts.rate', '1.5'], ['tts.mute', 'true']]);
-  const page = loadPage(pageScript, { store });
-  page.byId.test.fire('click');
-  const u = page.spoken.at(-1);
-  assert.ok(u, 'utterance spoken');
-  assert.equal(u.voice?.name, 'Bob');
-  assert.equal(u.rate, 1.5);
-});
-
-test('page reloads on pagetag mismatch, stays put on match', () => {
-  const tag = pageScript.match(/PAGE_TAG = '([0-9a-f]{12})'/)?.[1];
-  assert.ok(tag, 'embedded page tag found');
-  const page = loadPage(pageScript);
-  page.fireEvent('pagetag', tag);
-  assert.equal(page.wasReloaded(), false);
-  page.fireEvent('pagetag', 'somethingelse');
-  assert.equal(page.wasReloaded(), true);
-});
-
-test('served page and SSE announce the same tag', async () => {
-  const html = await (await fetch(`${BASE}/`)).text();
-  const embedded = html.match(/PAGE_TAG = '([0-9a-f]{12})'/)?.[1];
-  const announced = await new Promise((resolve) => {
-    const req = http.get(`${BASE}/events`, (res) => {
-      let buf = '';
-      res.on('data', (chunk) => {
-        buf += chunk;
-        const m = buf.match(/event: pagetag\ndata: ([0-9a-f]{12})/);
-        if (m) { req.destroy(); resolve(m[1]); }
-      });
+function runHook(payload, env) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [HOOK], {
+      env: { ...process.env, ...env },
+      stdio: ['pipe', 'ignore', 'ignore'],
     });
+    child.on('exit', (code) => resolve(code));
+    child.stdin.end(JSON.stringify(payload));
   });
-  assert.equal(announced, embedded);
+}
+
+test('the hook spawns the pipeline and exits 0 without waiting for it', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tts-e2e-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const { piper, player, voice } = stubs(dir);
+
+  const code = await runHook(
+    { hook_event_name: 'Stop', last_assistant_message: '## Done\n\nFixed `parser.mjs`.' },
+    { CLAUDE_TTS_PIPER: piper, CLAUDE_TTS_VOICE: voice, CLAUDE_TTS_PLAYER: player },
+  );
+  assert.equal(code, 0);
+
+  const piperArgv = await waitForFile(path.join(dir, 'piper-argv.txt'));
+  assert.match(piperArgv, /--model/);
+  assert.match(piperArgv, /--output_raw/);
+
+  const spoken = await waitForFile(path.join(dir, 'piper-stdin.txt'));
+  assert.match(spoken, /Done/);
+  assert.match(spoken, /Fixed parser\.mjs\./);
+  assert.doesNotMatch(spoken, /#|`/);
+
+  const playerArgv = await waitForFile(path.join(dir, 'player-argv.txt'));
+  assert.match(playerArgv, /-ar 22050/);
+  assert.match(playerArgv, /-nodisp/);
+
+  assert.match(await waitForFile(path.join(dir, 'player-stdin.txt')), /AUDIO/);
 });
 
-test('log keeps at most 10 entries', () => {
-  const page = loadPage(pageScript);
-  for (let i = 0; i < 15; i++) page.receiveJson({ text: `q${i}`, session: 'a' });
-  assert.equal(page.byId.log.children.length, 10);
+test('a second reply records a new pipeline pid', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tts-pid-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const { piper, player, voice } = stubs(dir);
+  const env = { CLAUDE_TTS_PIPER: piper, CLAUDE_TTS_VOICE: voice, CLAUDE_TTS_PLAYER: player };
+
+  await runHook({ last_assistant_message: 'first reply' }, env);
+  await waitForFile(path.join(dir, 'piper-stdin.txt'));
+  const first = await waitForFile(pidPath());
+
+  await runHook({ last_assistant_message: 'second reply' }, env);
+  const deadline = Date.now() + 10_000;
+  let second = first;
+  while (second === first && Date.now() < deadline) {
+    second = await waitForFile(pidPath());
+    if (second === first) await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.notEqual(second, first);
 });

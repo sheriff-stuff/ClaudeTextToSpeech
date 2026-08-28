@@ -1,12 +1,11 @@
 {
   "hooks": {
-    "PreToolUse": [
+    "Stop": [
       {
-        "matcher": "AskUserQuestion",
         "hooks": [
           {
             "type": "command",
-            "command": "node \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/notify-question.mjs",
+            "command": "node \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/speak-reply.mjs",
             "timeout": 5
           }
         ]
