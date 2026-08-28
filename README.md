@@ -1,77 +1,81 @@
 # ClaudeTextToSpeech
 
-Speaks Claude Code's questions aloud. A `PreToolUse` hook on the `AskUserQuestion` tool forwards the question text to a tiny local server, and a browser page speaks it via `speechSynthesis`. Only text ever crosses a machine boundary — synthesis and playback happen wherever the browser runs.
+Speaks Claude Code's replies aloud. A `Stop` hook fires when a reply finishes, cleans the markdown for the ear, and pipes it through [Piper](https://github.com/rhasspy/piper) into a player. Local synthesis, no network, no browser, no account.
 
-Built for the remote case: Claude Code on a Linux dev box (reached through Coder), you sitting at a Windows machine. The forwarded port carries the page and the event stream to your local browser. It also works trivially when everything is on one machine.
+Windows, Node 18+, no dependencies, no build.
 
 ## Parts
 
-| File | Runs where | Role |
-| --- | --- | --- |
-| `server.mjs` | where Claude Code runs | `POST /speak` → broadcast over SSE `GET /events`; `GET /` serves the speaker page. Node 18+, no deps. |
-| `.claude/hooks/notify-question.mjs` | where Claude Code runs | Hook: extracts `tool_input.questions[].question`, POSTs the joined text, 1s timeout, always exits 0. |
-| `.claude/settings.json` | project-level registration | `PreToolUse` hook with `"matcher": "AskUserQuestion"`. |
-
-The port is `CLAUDE_TTS_PORT` (default 8765), read by both hook and server. The server binds `127.0.0.1` only.
-
-## Behaviour
-
-- Speaks the question text only — not headers, not answer options. Multiple questions in one call are joined.
-- No replay: if no page is connected, the message is dropped. A question spoken minutes late is noise.
-- Fail silent everywhere: server down → hook times out and exits 0; the question dialogue is unaffected.
-- The page speaks inside the `EventSource` message handler, so it works from a background tab (network events wake tabs; timers are throttled).
+| File | Role |
+| --- | --- |
+| `.claude/hooks/speak-reply.mjs` | The hook. Cleans `last_assistant_message`, kills any playback still running, starts the pipeline, exits 0. |
+| `.claude/hooks/speak-run.mjs` | The pipeline. Feeds the text to Piper and pipes its raw PCM into the player. Outlives the hook. |
+| `.claude/settings.json` | Registers the `Stop` hook for this repo. |
+| `test.mjs` | `node --test test.mjs`. Cleaner, payload handling, and the real spawned pipeline against stub binaries. |
+| `smoke.mjs` | `node smoke.mjs`. Speaks a sample through the real Piper, for the part only ears can judge. |
 
 ## Setup
 
-1. Start the server where Claude Code runs: `node server.mjs` (tmux, a spare terminal — your choice; a Coder startup script or systemd user unit also works, undocumented here on purpose).
-2. Open `http://localhost:8765` in your browser. When remote, VS Code/Coder port forwarding gets you there — VS Code usually auto-forwards the port when it sees it listening.
-3. Click **Enable sound** (browser autoplay policy requires one gesture; you'll hear "sound enabled").
-4. Pin the tab and exempt it from tab discarding (Edge: site permissions → never put to sleep; Chrome: Memory Saver exceptions). Tab discard, not autoplay, is the main reliability risk.
+1. Download `piper_windows_amd64.zip` from the [Piper releases](https://github.com/rhasspy/piper/releases) and unzip it to `C:\piper`.
+2. Download a voice into the `voices` folder there: `en_GB-alba-medium.onnx` and its `.onnx.json` config, from [the voice list](https://rhasspy.github.io/piper-samples/). Both files. The config carries the sample rate; without it the speech plays at the wrong pitch.
+3. Make sure `ffplay` (part of ffmpeg) is on `PATH`.
+4. Run `/hooks` or start a new session, so the hook registration is picked up.
 
-Hook registration in this repo is project-level (`.claude/settings.json`), which is what you want while developing here. On the work dev box, register user-level instead so every repo speaks.
+That is the whole setup. Nothing to configure: the hook looks under `C:\piper` and uses what it finds, picking the first voice alphabetically when there are several. Check it with `node smoke.mjs`, which prints what it found before making any noise.
 
-## Installing on a remote box
+Environment variables override discovery, for an install somewhere else:
 
-1. Copy `server.mjs` anywhere on the dev box (e.g. `~/claude-tts/server.mjs`).
-2. Copy `.claude/hooks/notify-question.mjs` to `~/.claude/hooks/notify-question.mjs`.
-3. Add to `~/.claude/settings.json` (merge into an existing `hooks` block if there is one):
+| Variable | Meaning |
+| --- | --- |
+| `CLAUDE_TTS_PIPER` | Path to the Piper binary. |
+| `CLAUDE_TTS_VOICE` | Path to the `.onnx` voice model. |
+| `CLAUDE_TTS_PLAYER` | Raw-PCM player, default `ffplay`. |
 
-   ```json
-   {
-     "hooks": {
-       "PreToolUse": [
-         {
-           "matcher": "AskUserQuestion",
-           "hooks": [
-             {
-               "type": "command",
-               "command": "node \"$HOME\"/.claude/hooks/notify-question.mjs",
-               "timeout": 5
-             }
-           ]
-         }
-       ]
-     }
-   }
-   ```
+With no Piper and no voice found, the hook stays silent.
 
-4. Start the server: `node ~/claude-tts/server.mjs`.
-5. Hook config is snapshotted at session start — run `/hooks` or start a new session to pick it up.
-6. Open `http://localhost:8765` in your local browser (via the forwarded port), click **Enable sound**, pin the tab, exempt it from tab discarding.
-7. Verify with the `curl` command below, then with a real question.
+## Behaviour
 
-## Verifying
+- Speaks the final reply of a turn. Subagents fire `SubagentStop`, a different event, so they stay silent.
+- Markdown is cleaned first: headings, bullets, links and emphasis lose their syntax; a fenced block becomes "code block, twelve lines"; a table row is read as a sentence.
+- Replies are spoken in full, however long. A new reply interrupts whatever is still playing.
+- Fail silent everywhere: no Piper, no voice, no player, bad payload — the hook exits 0 and the session never notices.
 
-With the server running and the page's sound enabled:
+## Turning it off
+
+Create the mute file and the hook stays quiet; delete it to resume. Both work mid-session, no restart.
 
 ```sh
-curl -s -X POST --data "Testing one two three" http://localhost:8765/speak
+node .claude/hooks/speak-reply.mjs --where   # prints the mute and pid file paths
 ```
 
-You should hear it. Then ask Claude Code something that makes it use AskUserQuestion and hear the real thing.
+To silence just the reply currently playing, kill the player.
+
+## Every repo, not just this one
+
+Registration here is project-level, which is what you want while working on this repo. To have every session speak, put the same block in `~/.claude/settings.json` and point it at a copy of the two hook files:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$HOME\"/.claude/hooks/speak-reply.mjs",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`speak-run.mjs` must sit beside `speak-reply.mjs`; the hook finds it by relative path.
 
 ## Non-goals
 
-- Speaking ordinary responses or Notification events (permission prompts) — the latter could be added later on the same pipeline.
+- Speaking questions, permission prompts, or anything mid-turn.
 - Cloud TTS.
-- The VS Code extension version — separate idea, separate doc.
+- Summarizing the reply rather than reading it.

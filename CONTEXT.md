@@ -4,16 +4,18 @@ Glossary for ClaudeTextToSpeech. Terms only — no implementation details.
 
 ## Terms
 
-**Question** — the text of a single question Claude Code puts to the user via its AskUserQuestion tool. The spoken unit of this system. Only the question text is spoken — never its header or answer options.
+**Reply** — the text Claude Code puts on screen when it finishes a turn and hands control back to you. The spoken unit of this system.
 
-**Hook** — the script Claude Code runs on the dev box just before an AskUserQuestion dialogue appears. It forwards the question to the Question Server and must never delay or break the session, even when the server is absent.
+**Hook** — the script Claude Code runs when a reply finishes. It cleans the reply and starts the Pipeline, then gets out of the way. It must never delay or break the session, even when nothing is installed.
 
-**Question Server** — the process on the dev box that receives questions from the Hook and broadcasts them to connected Speaker Pages. It holds no history: a question with no listener is dropped.
+**Pipeline** — the pair of processes that turn cleaned text into sound: the synthesizer feeding the player. It outlives the Hook and keeps talking after the session has moved on.
 
-**Speaker Page** — the browser page on the local machine that listens to the Question Server and speaks each question aloud through the local OS speech engine.
+**Synthesizer** — Piper, running locally from a binary and a voice model. No network, no account, no cloud.
 
-**Enable-sound gesture** — the one click the Speaker Page requires before it is allowed to produce audio; after it, the page may speak indefinitely.
+**Player** — the process that turns the synthesizer's raw audio into sound on the speakers.
 
-**Dev box** — the remote Linux machine where the Claude Code session, Hook, and Question Server run.
+**Cleaning** — rewriting a reply for the ear: markdown syntax removed, code blocks replaced by a count of their lines.
 
-**Local machine** — the Windows machine the user sits at, where the Speaker Page runs and audio plays. The only link between the two machines is a forwarded port.
+**Interrupt** — what happens when a reply finishes while the previous one is still being spoken: the older Pipeline is killed and the new reply starts immediately.
+
+**Mute file** — the file whose existence silences the Hook. Create it to shut the system up mid-session, delete it to resume.
